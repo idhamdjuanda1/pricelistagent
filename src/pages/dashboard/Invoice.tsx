@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore'
-import { db } from '../../lib/firebase'
+import {
+  addDoc,
+  collection,
+  doc,
+  onSnapshot,
+  setDoc,
+  serverTimestamp,
+} from 'firebase/firestore'
+import { auth, db } from '../../lib/firebase'
 
 type Addon = { name: string; price: number }
 type Term = { label: string; dueDate?: string; amount: number; paidAmount?: number }
@@ -27,9 +34,21 @@ type Deal = {
   dealPackage?: { name?: string; price?: number } | null
   createdAt?: any
 }
-
 type Vendor = { name?: string; whatsapp?: string; address?: string; npwp?: string; email?: string }
-type InvoiceDoc = { dealId: string; invoiceNo: string; invoiceDate: string; dueDate?: string; terms: Term[]; total: number }
+
+type InvoiceDoc = {
+  uid: string
+  dealId?: string
+  clientName?: string
+  clientWa?: string
+  address?: string
+  eventDesc?: string
+  invoiceNo: string
+  invoiceDate: string
+  dueDate?: string
+  terms: Term[]
+  total: number
+}
 
 const rupiah = (n: number) =>
   new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(n || 0)
@@ -48,8 +67,18 @@ const pickPkgPrice = (d: Deal) =>
 
 export default function Invoice() {
   const { dealId } = useParams()
+  const uid = auth.currentUser?.uid || ''
+
   const [deal, setDeal] = useState<Deal | null>(null)
   const [vendor, setVendor] = useState<Vendor | null>(null)
+
+  // Mode Manual (buat invoice tanpa deal)
+  const [manualMode, setManualMode] = useState<boolean>(() => !dealId || dealId === 'new')
+  const [mClientName, setMClientName] = useState('')
+  const [mClientWa, setMClientWa] = useState('')
+  const [mAddress, setMAddress] = useState('')
+  const [mEventDesc, setMEventDesc] = useState('') // deskripsi acara/pekerjaan manual
+  const [mTotal, setMTotal] = useState<number>(0)
 
   // Header invoice
   const [invoiceNo, setInvoiceNo] = useState('INV-2025/10/001')
@@ -59,15 +88,15 @@ export default function Invoice() {
   // Terms (cicilan)
   const [terms, setTerms] = useState<Term[]>([])
 
-  // ---- Ambil data Deal & Vendor
+  // ---- Ambil data Deal & Vendor (hanya bila mode normal)
   useEffect(() => {
-    if (!dealId) return
+    if (!dealId || manualMode) return
     const unsub = onSnapshot(doc(db, 'deals', dealId), (snap) => {
       if (snap.exists()) setDeal({ id: snap.id, ...(snap.data() as any) })
       else setDeal(null)
     })
     return () => unsub()
-  }, [dealId])
+  }, [dealId, manualMode])
 
   useEffect(() => {
     if (!deal?.uid) return
@@ -77,9 +106,13 @@ export default function Invoice() {
     return () => unsub()
   }, [deal?.uid])
 
-  // ---- Ambil/isi Invoice {dealId} (supaya term muncul)
+  // ---- Ambil/isi Invoice (normal: docId=dealId, manual: skip listener)
   useEffect(() => {
-    if (!dealId) return
+    if (manualMode || !dealId) {
+      // default untuk manual mode → 2 term
+      setDefaultTerms(0)
+      return
+    }
     const unsub = onSnapshot(doc(db, 'invoices', dealId), (snap) => {
       if (snap.exists()) {
         const inv = snap.data() as InvoiceDoc
@@ -88,25 +121,33 @@ export default function Invoice() {
         setDueDate(inv.dueDate || '')
         setTerms(Array.isArray(inv.terms) ? inv.terms : [])
       } else {
-        // default 2 term (bisa diedit user)
-        const total = calcTotal()
-        const t1 = Math.round(total * 0.5)
-        setTerms([
-          { label: 'Term 1', dueDate: '', amount: t1, paidAmount: 0 },
-          { label: 'Term 2', dueDate: '', amount: total - t1, paidAmount: 0 },
-        ])
+        const totalNow = calcTotal()
+        setDefaultTerms(totalNow)
       }
     })
     return () => unsub()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dealId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dealId, manualMode])
+
+  const setDefaultTerms = (totalFromDeal: number) => {
+    const base = totalFromDeal || 0
+    const t1 = Math.round(base * 0.5)
+    setTerms([
+      { label: 'Term 1', dueDate: '', amount: t1, paidAmount: 0 },
+      { label: 'Term 2', dueDate: '', amount: Math.max(base - t1, 0), paidAmount: 0 },
+    ])
+  }
 
   const addons = deal?.addonSummary || []
   const subTotal = (deal ? pickPkgPrice(deal) : 0) + addons.reduce((s, a) => s + (a.price || 0), 0)
-  const calcTotal = () => (typeof deal?.total === 'number' ? deal!.total! : subTotal) || 0
+  const calcTotal = () => {
+    if (manualMode) return mTotal || 0
+    return (typeof deal?.total === 'number' ? deal!.total! : subTotal) || 0
+  }
   const total = calcTotal()
 
   const eventLine = useMemo(() => {
+    if (manualMode) return mEventDesc || ''
     if (!deal) return ''
     const t = deal.eventType
     if (t === 'wedding' && deal.wedding) {
@@ -122,7 +163,7 @@ export default function Invoice() {
       return `Prewedding — ${p.date || '-'} @ ${p.place || '-'}`
     }
     return (deal.parent || pickPkgName(deal) || '').toString().toUpperCase()
-  }, [deal])
+  }, [deal, manualMode, mEventDesc])
 
   // ====== HANDLERS ======
   const addTerm = () => setTerms((t) => [...t, { label: `Term ${t.length + 1}`, amount: 0, paidAmount: 0 }])
@@ -134,9 +175,19 @@ export default function Invoice() {
   const diff = total - sumTerms
 
   const saveInvoice = async () => {
-    if (!dealId) return
+    const _uid = auth.currentUser?.uid
+    if (!_uid) {
+      alert('Harus login.')
+      return
+    }
+
     const payload: InvoiceDoc = {
-      dealId,
+      uid: _uid,
+      dealId: manualMode ? undefined : dealId,
+      clientName: manualMode ? (mClientName || undefined) : deal?.clientName,
+      clientWa: manualMode ? (mClientWa || undefined) : deal?.clientWa,
+      address: manualMode ? (mAddress || undefined) : deal?.address,
+      eventDesc: manualMode ? (mEventDesc || undefined) : eventLine || undefined,
       invoiceNo,
       invoiceDate,
       dueDate: dueDate || undefined,
@@ -148,31 +199,51 @@ export default function Invoice() {
       })),
       total,
     }
-    await setDoc(doc(db, 'invoices', dealId), { ...payload, updatedAt: serverTimestamp(), createdAt: serverTimestamp() }, { merge: true })
-    alert('Invoice (termasuk terms) tersimpan.')
+
+    if (manualMode) {
+      // simpan ke invoices/{autoId}
+      const ref = await addDoc(collection(db, 'invoices'), {
+        ...payload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+      alert(`Invoice manual tersimpan (ID: ${ref.id}).`)
+    } else {
+      // normal: invoices/{dealId}
+      if (!dealId) return
+      await setDoc(
+        doc(db, 'invoices', dealId),
+        { ...payload, createdAt: serverTimestamp(), updatedAt: serverTimestamp() },
+        { merge: true }
+      )
+      alert('Invoice (termasuk terms) tersimpan.')
+    }
   }
 
   const printInvoiceOnly = () => window.print()
 
-  if (deal === null) {
-    return (
-      <div className="container">
-        <div className="card torn">
-          <div className="banner">Deal tidak ditemukan.</div>
-          <div style={{ marginTop: 8 }}><Link className="btn" to="/dashboard/overview">Kembali</Link></div>
+  // ===== RENDER =====
+  if (!manualMode) {
+    if (deal === null) {
+      return (
+        <div className="container">
+          <div className="card torn">
+            <div className="banner">Deal tidak ditemukan.</div>
+            <div style={{ marginTop: 8 }}><Link className="btn" to="/dashboard/overview">Kembali</Link></div>
+          </div>
         </div>
-      </div>
-    )
-  }
-  if (!deal) {
-    return (
-      <div className="container">
-        <div className="card torn">
-          <div className="banner">Memuat invoice…</div>
-          <div style={{ marginTop: 8 }}><Link className="btn" to="/dashboard/overview">Kembali</Link></div>
+      )
+    }
+    if (!deal) {
+      return (
+        <div className="container">
+          <div className="card torn">
+            <div className="banner">Memuat invoice…</div>
+            <div style={{ marginTop: 8 }}><Link className="btn" to="/dashboard/overview">Kembali</Link></div>
+          </div>
         </div>
-      </div>
-    )
+      )
+    }
   }
 
   return (
@@ -180,7 +251,11 @@ export default function Invoice() {
       {/* ---- Toolbar ---- */}
       <div className="card torn no-print" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
         <h2 style={{margin:0}}>Invoice</h2>
-        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap', alignItems:'center'}}>
+          <label style={{display:'flex',gap:6,alignItems:'center'}}>
+            <input type="checkbox" checked={manualMode} onChange={(e)=>setManualMode(e.target.checked)} />
+            Mode Manual
+          </label>
           <button className="btn" onClick={saveInvoice}>Simpan</button>
           <button className="btn" onClick={printInvoiceOnly}>Print / PDF</button>
           <Link className="btn" to={`/dashboard/overview`}>Kembali ke Overview</Link>
@@ -205,7 +280,36 @@ export default function Invoice() {
         </div>
       </div>
 
-      {/* ---- TERMS (ini yang sebelumnya belum muncul) ---- */}
+      {/* ---- MODE MANUAL: data klien & total ---- */}
+      {manualMode && (
+        <div className="card no-print" style={{display:'grid',gap:8}}>
+          <h3 style={{margin:0}}>Data Klien (Manual)</h3>
+          <div className="row">
+            <div className="col">
+              <label>Nama Klien</label>
+              <input className="input" value={mClientName} onChange={(e)=>setMClientName(e.target.value)} />
+            </div>
+            <div className="col">
+              <label>WA Klien</label>
+              <input className="input" value={mClientWa} onChange={(e)=>setMClientWa(e.target.value)} />
+            </div>
+          </div>
+          <div>
+            <label>Alamat</label>
+            <textarea className="textarea" value={mAddress} onChange={(e)=>setMAddress(e.target.value)} />
+          </div>
+          <div>
+            <label>Deskripsi Acara / Pekerjaan</label>
+            <input className="input" value={mEventDesc} onChange={(e)=>setMEventDesc(e.target.value)} placeholder="Contoh: Dokumentasi Wedding, 12 Nov 2025 @ Gedung X" />
+          </div>
+          <div>
+            <label>Total</label>
+            <input className="input" type="number" min={0} value={mTotal} onChange={(e)=>setMTotal(Number(e.target.value)||0)} />
+          </div>
+        </div>
+      )}
+
+      {/* ---- TERMS ---- */}
       <div className="card no-print" style={{display:'grid',gap:8}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
           <h3 style={{margin:0}}>Invoice Terms</h3>
@@ -269,7 +373,6 @@ export default function Invoice() {
       {/* ---- KARTU INVOICE A6 (PRINT-ONLY AREA) ---- */}
       <div id="invoice-print" className="card" style={{ maxWidth: '105mm', margin: '0 auto' }}>
         <style>{`
-          /* PRINT HANYA KARTU INVOICE INI */
           @media print {
             body * { visibility: hidden; }
             #invoice-print, #invoice-print * { visibility: visible; }
@@ -299,49 +402,63 @@ export default function Invoice() {
 
           <div style={{ marginBottom: 8 }}>
             <div>Kepada Yth:</div>
-            <div style={{ fontWeight: 700 }}>{deal.clientName || '-'}</div>
-            {deal.address && <div style={{ whiteSpace: 'pre-wrap' }}>{deal.address}</div>}
-            {deal.clientWa && <div>WA: {deal.clientWa}</div>}
+            <div style={{ fontWeight: 700 }}>{(manualMode ? mClientName : deal?.clientName) || '-'}</div>
+            {(manualMode ? mAddress : deal?.address) && (
+              <div style={{ whiteSpace: 'pre-wrap' }}>
+                {manualMode ? mAddress : (deal?.address as string)}
+              </div>
+            )}
+            {(manualMode ? mClientWa : deal?.clientWa) && (
+              <div>WA: {manualMode ? mClientWa : deal?.clientWa}</div>
+            )}
           </div>
 
           <div style={{ margin: '8px 0', fontStyle: 'italic', color: '#555' }}>
-            {eventLine || pickPkgName(deal)}
+            {eventLine || (manualMode ? '' : pickPkgName(deal!))}
           </div>
 
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: 'left', borderBottom: '1px solid #e5e7eb', padding: '6px 4px' }}>Deskripsi</th>
-                <th style={{ textAlign: 'right', borderBottom: '1px solid #e5e7eb', padding: '6px 4px', width: 120 }}>Nominal</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td style={{ padding: '6px 4px' }}>Paket: <b>{pickPkgName(deal) || '-'}</b></td>
-                <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(pickPkgPrice(deal))}</td>
-              </tr>
-              {(addons || []).map((a, i) => (
-                <tr key={i}>
-                  <td style={{ padding: '6px 4px' }}>Add-on: {a.name}</td>
-                  <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(a.price || 0)}</td>
-                </tr>
-              ))}
-              <tr>
-                <td style={{ padding: '6px 4px', borderTop: '1px dashed #e5e7eb' }}><b>Sub-total</b></td>
-                <td style={{ padding: '6px 4px', textAlign: 'right', borderTop: '1px dashed #e5e7eb' }}><b>{rupiah(subTotal)}</b></td>
-              </tr>
-              {total !== subTotal && (
+          {!manualMode && (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
                 <tr>
-                  <td style={{ padding: '6px 4px' }}>Penyesuaian</td>
-                  <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(total - subTotal)}</td>
+                  <th style={{ textAlign: 'left', borderBottom: '1px solid #e5e7eb', padding: '6px 4px' }}>Deskripsi</th>
+                  <th style={{ textAlign: 'right', borderBottom: '1px solid #e5e7eb', padding: '6px 4px', width: 120 }}>Nominal</th>
                 </tr>
-              )}
-              <tr>
-                <td style={{ padding: '6px 4px' }}><b>Total</b></td>
-                <td style={{ padding: '6px 4px', textAlign: 'right' }}><b>{rupiah(total)}</b></td>
-              </tr>
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                <tr>
+                  <td style={{ padding: '6px 4px' }}>Paket: <b>{pickPkgName(deal!) || '-'}</b></td>
+                  <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(pickPkgPrice(deal!))}</td>
+                </tr>
+                {(deal?.addonSummary || []).map((a, i) => (
+                  <tr key={i}>
+                    <td style={{ padding: '6px 4px' }}>Add-on: {a.name}</td>
+                    <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(a.price || 0)}</td>
+                  </tr>
+                ))}
+                <tr>
+                  <td style={{ padding: '6px 4px', borderTop: '1px dashed #e5e7eb' }}><b>Sub-total</b></td>
+                  <td style={{ padding: '6px 4px', textAlign: 'right', borderTop: '1px dashed #e5e7eb' }}><b>{rupiah(subTotal)}</b></td>
+                </tr>
+                {calcTotal() !== subTotal && (
+                  <tr>
+                    <td style={{ padding: '6px 4px' }}>Penyesuaian</td>
+                    <td style={{ padding: '6px 4px', textAlign: 'right' }}>{rupiah(calcTotal() - subTotal)}</td>
+                  </tr>
+                )}
+                <tr>
+                  <td style={{ padding: '6px 4px' }}><b>Total</b></td>
+                  <td style={{ padding: '6px 4px', textAlign: 'right' }}><b>{rupiah(calcTotal())}</b></td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+
+          {manualMode && (
+            <div style={{ marginTop: 4, fontWeight: 700 }}>
+              Total: {rupiah(mTotal || 0)}
+            </div>
+          )}
 
           {/* RINGKASAN TERMS DI CETAKAN */}
           {terms.length > 0 && (

@@ -491,7 +491,7 @@ export default function Mou() {
 
       const writePara = (text: string) => {
         const lines = pdf.splitTextToSize((text || "").replace(/\r/g, ""), wrapWidth);
-        lines.forEach((ln) => {
+        lines.forEach((ln: string) => {
           addPageIfNeeded();
           pdf.text(String(ln), marginLeft, y, { maxWidth: wrapWidth });
           y += lineHeight;
