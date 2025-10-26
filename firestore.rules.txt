@@ -1,0 +1,110 @@
+// Firestore Rules — Pricelist Interaktif (updated + MOU + recovery)
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== Helpers =====
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // ---------- vendors/{uid} ----------
+    // Publish perlu read publik
+    match /vendors/{uid} {
+      allow read: if true;
+      allow create, update, delete: if isOwner(uid);
+    }
+
+    // ---------- packages/{id} ----------
+    // { uid, parent, typeName, details[], price }
+    match /packages/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.uid);
+    }
+
+    // ---------- addons/{id} ----------
+    // { uid, name, price }
+    match /addons/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.uid);
+    }
+
+    // ---------- discounts/{uid} ----------
+    // { text, enabled }
+    match /discounts/{uid} {
+      allow read: if true;
+      allow create, update, delete: if isOwner(uid);
+    }
+
+    // ---------- tokens/{uid} ----------
+    // { uid, expiresAt (Timestamp), lastExtendedAt (Timestamp) }
+    // Halaman publik (publish/deal) butuh bisa cek aktif/tidak → read publik
+    match /tokens/{uid} {
+      allow read: if true;
+      allow write: if isOwner(uid);
+    }
+
+    // ---------- tokenStore/{token} ----------
+    // { token, status: 'idle'|'used', duration: 'daily'|'weekly'|'monthly', uid?, usedAt?, createdAt }
+    // Dev-side (untuk produksi sebaiknya via Cloud Functions)
+    match /tokenStore/{token} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      allow update: if signedIn() && request.resource.data.uid == request.auth.uid;
+      // delete: deny (default)
+    }
+
+    // ---------- links/{id} ----------
+    // { uid, title, url, createdAt }
+    match /links/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if signedIn() && request.auth.uid == resource.data.uid;
+    }
+
+    // ---------- deals/{id} ----------
+    // Create publik (form Deal). Read/Update/Delete hanya owner.
+    // Disederhanakan: cukup pastikan 'uid' ada & non-empty.
+    match /deals/{id} {
+      allow create: if request.resource.data.uid is string
+                    && request.resource.data.uid.size() > 0;
+      allow read, update, delete: if isOwner(resource.data.uid);
+    }
+
+    // ---------- mous/{id} ----------
+    // Dokumen MOU privat per dealId; hanya owner (vendor) yang boleh baca/tulis.
+    // Minimal wajib ada field uid (vendor) saat create.
+    // Tambahan: "recovery update" untuk dokumen lama yang belum punya uid.
+    match /mous/{id} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+
+      // Normal: cek owner dari resource.data.uid
+      // Recovery: jika resource.data.uid belum ada/null,
+      //           izinkan update JIKA request.resource.data.uid == auth.uid
+      allow read, update, delete: if
+        isOwner(resource.data.uid) ||
+        ( signedIn() && (resource.data.uid == null) && (request.resource.data.uid == request.auth.uid) );
+    }
+
+    // ---------- mouDefaults/{uid} ----------
+    // Template default MOU per-UID (privat owner-only)
+    match /mouDefaults/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update, delete: if isOwner(uid);
+    }
+  }
+
+
+    match /invoices/{invoiceId} {
+  allow read: if request.auth != null && resource.data.uid == request.auth.uid;
+  allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+  allow update, delete: if request.auth != null && resource.data.uid == request.auth.uid;
+}
+
+match /receipts/{receiptId} {
+  allow read: if request.auth != null && resource.data.uid == request.auth.uid;
+  allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+  allow update, delete: if request.auth != null && resource.data.uid == request.auth.uid;
+}
+}

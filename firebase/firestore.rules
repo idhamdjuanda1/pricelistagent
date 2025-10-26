@@ -1,0 +1,54 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Vendor profile: publish perlu read publik
+    match /vendors/{uid} {
+      allow read: if true;
+      allow create, update, delete: if isOwner(uid);
+    }
+
+    // Packages (pricelist jenis per parent)
+    match /packages/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.uid);
+    }
+
+    // Add-ons
+    match /addons/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.uid);
+    }
+
+    // Popup Diskon
+    match /discounts/{uid} {
+      allow read: if true;
+      allow create, update, delete: if isOwner(uid);
+    }
+
+    // Masa aktif user: read publik (untuk Superadmin dashboard), write hanya pemilik
+    match /tokens/{uid} {
+      allow read: if true;
+      allow write: if isOwner(uid);
+    }
+
+    // Gudang token superadmin (dev-side; produksi via CF)
+    // Tetap butuh signed-in; Superadmin melakukan Anonymous Auth otomatis.
+    match /tokenStore/{token} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      allow update: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    // Overview Links
+    match /links/{id} {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if signedIn() && request.auth.uid == resource.data.uid;
+    }
+  }
+}

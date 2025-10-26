@@ -1,0 +1,5 @@
+{
+  "src/pages/dashboard/Invoice.tsx": "Created component with simple layout and back link.",
+  "src/pages/dashboard/Kuitansi.tsx": "Created component with simple layout and back link.",
+  "src/App.tsx": "Cleaned imports, removed inline placeholders, added proper page imports and routes."
+}
